@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+app/__init__.py
+app/main.py
+offline_platform_api.egg-info/PKG-INFO
+offline_platform_api.egg-info/SOURCES.txt
+offline_platform_api.egg-info/dependency_links.txt
+offline_platform_api.egg-info/requires.txt
+offline_platform_api.egg-info/top_level.txt
+tests/test_workflow.py

@@ -1,0 +1,14 @@
+alembic>=1.16.0
+cryptography>=45.0.0
+fastapi>=0.116.0
+passlib[argon2]>=1.7.4
+PyJWT>=2.9.0
+psycopg[binary]>=3.2.0
+pydantic-settings>=2.10.0
+python-multipart>=0.0.20
+sqlalchemy>=2.0.40
+uvicorn[standard]>=0.35.0
+
+[dev]
+httpx>=0.28.0
+pytest>=8.3.0

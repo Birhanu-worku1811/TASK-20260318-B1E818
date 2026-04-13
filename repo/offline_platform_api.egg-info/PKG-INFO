@@ -1,0 +1,51 @@
+Metadata-Version: 2.4
+Name: offline-platform-api
+Version: 0.1.0
+Summary: Offline Retail Checkout and Entrepreneurship Project Incubation API
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: alembic>=1.16.0
+Requires-Dist: cryptography>=45.0.0
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: passlib[argon2]>=1.7.4
+Requires-Dist: PyJWT>=2.9.0
+Requires-Dist: psycopg[binary]>=3.2.0
+Requires-Dist: pydantic-settings>=2.10.0
+Requires-Dist: python-multipart>=0.0.20
+Requires-Dist: sqlalchemy>=2.0.40
+Requires-Dist: uvicorn[standard]>=0.35.0
+Provides-Extra: dev
+Requires-Dist: httpx>=0.28.0; extra == "dev"
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+
+# Offline Platform API
+
+FastAPI + SQLAlchemy + PostgreSQL backend for offline retail checkout and entrepreneurship project incubation operations.
+
+## Run
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+uvicorn app.main:app --reload --reload-dir app --reload-exclude ".venv/*"
+```
+
+## Swagger / OpenAPI
+
+- Swagger UI: `http://127.0.0.1:8000/docs`
+- Alias: `http://127.0.0.1:8000/swagger`
+- ReDoc: `http://127.0.0.1:8000/redoc`
+- OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
+
+## Seed admin
+
+```bash
+python scripts/seed_admin.py
+```
+
+## Mandatory tests
+
+```bash
+./run_tests.sh
+```
