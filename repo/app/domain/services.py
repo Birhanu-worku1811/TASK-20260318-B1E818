@@ -4,7 +4,6 @@ import csv
 import hashlib
 import io
 import json
-import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -102,6 +101,23 @@ def _detect_attachment_type(file_bytes: bytes) -> tuple[str, str] | None:
     if file_bytes.startswith(b"\x89PNG\r\n\x1A\n"):
         return (".png", "image/png")
     return None
+
+
+def _sanitize_attachment_filename(filename: str) -> str:
+    if not filename:
+        raise DomainError("Filename is required")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in filename):
+        raise DomainError("Filename contains control characters")
+    if "/" in filename or "\\" in filename:
+        raise DomainError("Filename must not include path separators")
+    if ".." in filename:
+        raise DomainError("Filename must not include parent directory traversal")
+    basename = Path(filename).name
+    if basename != filename:
+        raise DomainError("Filename must be a basename")
+    if basename in {".", ".."}:
+        raise DomainError("Invalid filename")
+    return basename
 
 
 def _idempotency_scope(*, operation: str, order_id: Any, actor_user_id: Any, idempotency_key: str) -> str:
@@ -213,8 +229,6 @@ def create_shift(
             "ends_at": ends_at.isoformat(),
         },
     )
-    db.commit()
-    db.refresh(shift)
     return shift
 
 
@@ -257,8 +271,6 @@ def update_shift(
         "shift_updated",
         {"shift_id": str(shift.id), "starts_at": shift.starts_at.isoformat(), "ends_at": shift.ends_at.isoformat(), "note": shift.note},
     )
-    db.commit()
-    db.refresh(shift)
     return shift
 
 
@@ -274,8 +286,6 @@ def update_shift_status(db: Session, *, shift_id: Any, status: ShiftStatus, acto
         raise DomainError(f"Invalid shift transition from {shift.status.value} to {status.value}")
     shift.status = status
     write_audit(db, actor_user_id, "shift_status_changed", {"shift_id": str(shift.id), "status": status.value})
-    db.commit()
-    db.refresh(shift)
     return shift
 
 
@@ -305,8 +315,6 @@ def grant_role_binding(db: Session, *, target_user_id: Any, role: RoleType, acto
         "permission_granted",
         {"target_user_id": str(target_user_id), "to_role": role.value},
     )
-    db.commit()
-    db.refresh(binding)
     return binding
 
 
@@ -332,7 +340,6 @@ def revoke_role_binding(db: Session, *, target_user_id: Any, role: RoleType, act
         "permission_revoked",
         {"target_user_id": str(target_user_id), "from_role": role.value},
     )
-    db.commit()
 
 
 def update_role_binding(db: Session, *, binding_id: int, new_role: RoleType, actor_user_id: Any) -> UserRoleBinding:
@@ -363,8 +370,6 @@ def update_role_binding(db: Session, *, binding_id: int, new_role: RoleType, act
         "permission_updated",
         {"target_user_id": str(binding.user_id), "from_role": old_role.value, "to_role": new_role.value},
     )
-    db.commit()
-    db.refresh(binding)
     return binding
 
 
@@ -594,7 +599,6 @@ def print_receipt_for_order(db: Session, *, order_id: Any, actor_user_id: Any) -
     adapter = build_printer_adapter(settings)
     adapter.print_receipt(payload)
     write_audit(db, actor_user_id, "receipt_printed", {"order_id": str(order.id), "backend": settings.receipt_printer_backend})
-    db.commit()
     return {"order_id": str(order.id), "backend": settings.receipt_printer_backend, "line_count": len(lines)}
 
 
@@ -855,6 +859,34 @@ def submit_project(db: Session, project_id: Any, content: dict[str, Any], user_i
     return project
 
 
+def edit_project_draft(db: Session, project_id: Any, content: dict[str, Any], user_id: Any) -> Project:
+    project = db.get(Project, project_id)
+    if not project:
+        raise DomainError("Project not found")
+    if project.status not in {ProjectStatus.DRAFT, ProjectStatus.REJECTED}:
+        raise DomainError("Project can only be edited in draft or rejected state")
+    latest = db.scalar(select(ProjectVersion).where(ProjectVersion.project_id == project_id).order_by(ProjectVersion.version_no.desc()).limit(1))
+    if not latest:
+        raise DomainError("Project version not found")
+    previous_content = latest.content or {}
+    diff = _dict_diff(previous_content, content)
+    latest.content = content
+    latest.diff_summary = str(diff)
+    write_audit(
+        db,
+        user_id,
+        "project_draft_edited",
+        {
+            "project_id": str(project_id),
+            "version": latest.version_no,
+            "changed_fields": list(diff.keys()),
+        },
+    )
+    db.commit()
+    db.refresh(project)
+    return project
+
+
 def update_project_status(db: Session, project_id: Any, status: ProjectStatus, user_id: Any) -> Project:
     project = db.get(Project, project_id)
     if not project:
@@ -871,8 +903,6 @@ def update_project_status(db: Session, project_id: Any, status: ProjectStatus, u
         raise DomainError(f"Invalid state transition from {project.status.value} to {status.value}")
     project.status = status
     write_audit(db, user_id, "project_status_changed", {"project_id": str(project_id), "status": status.value})
-    db.commit()
-    db.refresh(project)
     return project
 
 
@@ -885,7 +915,8 @@ def get_project_diff(db: Session, project_id: Any, from_version: int, to_version
 
 
 def save_attachment(db: Session, *, project_id: Any, filename: str, mime_type: str, file_bytes: bytes, base_path: str = "./storage") -> Attachment:
-    normalized_ext = Path(filename).suffix.lower()
+    sanitized_filename = _sanitize_attachment_filename(filename)
+    normalized_ext = Path(sanitized_filename).suffix.lower()
     if normalized_ext == ".jpeg":
         normalized_ext = ".jpg"
     ext_to_mime = {
@@ -907,21 +938,24 @@ def save_attachment(db: Session, *, project_id: Any, filename: str, mime_type: s
     if len(file_bytes) > max_bytes:
         raise DomainError("Attachment too large")
     fingerprint = hashlib.sha256(file_bytes).hexdigest()
-    os.makedirs(base_path, exist_ok=True)
-    path = f"{base_path}/{fingerprint}_{filename}"
-    with open(path, "wb") as f:
+    storage_root = Path(base_path).resolve()
+    storage_root.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{uuid.uuid4().hex}_{fingerprint[:12]}{normalized_ext}"
+    resolved_path = (storage_root / safe_name).resolve()
+    if storage_root not in resolved_path.parents:
+        raise DomainError("Resolved attachment path escapes storage root")
+    with open(resolved_path, "wb") as f:
         f.write(file_bytes)
     attachment = Attachment(
         project_id=project_id,
-        filename=filename,
+        filename=sanitized_filename,
         mime_type=detected_mime,
         size_bytes=len(file_bytes),
         sha256_fingerprint=fingerprint,
-        file_path=path,
+        file_path=str(resolved_path),
     )
     db.add(attachment)
-    db.commit()
-    db.refresh(attachment)
+    db.flush()
     return attachment
 
 
@@ -977,8 +1011,6 @@ def mark_notification_read_for_user(db: Session, notification_id: Any, user_id: 
     if note.recipient_user_id != user_id:
         raise DomainError("Cannot read notifications that do not belong to you")
     note.read_at = utcnow()
-    db.commit()
-    db.refresh(note)
     return note
 
 

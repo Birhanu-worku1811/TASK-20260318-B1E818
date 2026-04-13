@@ -14,6 +14,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///./offline_platform.db"
 os.environ.setdefault("ALLOW_DEV_SQLITE_OVERRIDE", "true")
 
 from app.domain.services import (
+    DomainError,
     NotificationEvent,
     auto_void_unsettled_orders,
     calculate_cart,
@@ -24,6 +25,7 @@ from app.domain.services import (
     process_refund,
     process_reverse_settlement,
     push_notification,
+    save_attachment,
 )
 from app.infra.config import Settings, get_settings, validate_runtime_settings
 from app.infra.db import Base, SessionLocal, engine
@@ -32,6 +34,7 @@ from app.main import app
 from app.models.entities import (
     AccountingReversal,
     AccessLog,
+    Attachment,
     AfterSalesOrder,
     AuditLog,
     FeatureDefinition,
@@ -43,6 +46,7 @@ from app.models.entities import (
     PaymentMethod,
     PermissionChangeLog,
     Project,
+    ProjectVersion,
     Product,
     ProjectStatus,
     PromotionRule,
@@ -92,6 +96,36 @@ def test_runtime_requires_postgresql_without_explicit_dev_override():
             app_env="prod",
             database_url="postgresql+psycopg://postgres:postgres@localhost:5432/offline_platform",
             jwt_secret="a" * 32,
+            master_encryption_key="x" * 44,
+        )
+    )
+
+
+def test_runtime_rejects_placeholder_secrets_outside_dev_safe_mode():
+    with pytest.raises(RuntimeError):
+        validate_runtime_settings(
+            Settings(
+                app_env="prod",
+                database_url="postgresql+psycopg://postgres:postgres@localhost:5432/offline_platform",
+                jwt_secret="dev-secret-change-me",
+                master_encryption_key="x" * 44,
+            )
+        )
+    with pytest.raises(RuntimeError):
+        validate_runtime_settings(
+            Settings(
+                app_env="prod",
+                database_url="postgresql+psycopg://postgres:postgres@localhost:5432/offline_platform",
+                jwt_secret="a" * 32,
+                master_encryption_key="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            )
+        )
+    validate_runtime_settings(
+        Settings(
+            app_env="test",
+            database_url="postgresql+psycopg://postgres:postgres@localhost:5432/offline_platform",
+            jwt_secret="dev-secret-change-me",
+            master_encryption_key="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         )
     )
 
@@ -229,6 +263,87 @@ def test_project_status_action_contract_and_state_machine():
     with SessionLocal() as db:
         current = db.get(Project, project_id)
         assert current.current_version_no == 2
+
+
+def test_project_edit_lifecycle_draft_and_rejected_with_diff_correctness():
+    with SessionLocal() as db:
+        create_user(db, "edit_owner", "StrongPass12!", "Edit Owner", RoleType.PROJECT_APPLICANT, None, None)
+        create_user(db, "edit_reviewer", "StrongPass12!", "Edit Reviewer", RoleType.REVIEWER, None, None)
+
+    client = TestClient(app)
+    owner_headers = _auth_headers("edit_owner", "StrongPass12!")
+    reviewer_headers = _auth_headers("edit_reviewer", "StrongPass12!")
+
+    created = client.post(
+        "/api/v1/projects",
+        json={"title": "Lifecycle Project", "content": {"goal": "initial", "budget": 1}},
+        headers=owner_headers,
+    )
+    assert created.status_code == 200
+    project_id = created.json()["data"]["id"]
+
+    draft_edit = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"content": {"goal": "draft-edited", "budget": 10}},
+        headers=owner_headers,
+    )
+    assert draft_edit.status_code == 200
+    _assert_success_envelope(draft_edit.json())
+    assert draft_edit.json()["data"]["version"] == 1
+    assert draft_edit.json()["data"]["status"] == "draft"
+
+    first_submit = client.post(
+        f"/api/v1/projects/{project_id}/submit",
+        json={"content": {"goal": "submitted-v2", "budget": 20}},
+        headers=owner_headers,
+    )
+    assert first_submit.status_code == 200
+    assert first_submit.json()["data"]["version"] == 2
+
+    start_review = client.patch(f"/api/v1/projects/{project_id}/status", json={"action": "start_review"}, headers=reviewer_headers)
+    assert start_review.status_code == 200
+    rejected = client.patch(f"/api/v1/projects/{project_id}/status", json={"action": "reject"}, headers=reviewer_headers)
+    assert rejected.status_code == 200
+
+    rejected_edit = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"content": {"goal": "rejected-edited", "budget": 25, "notes": "revise"}},
+        headers=owner_headers,
+    )
+    assert rejected_edit.status_code == 200
+    assert rejected_edit.json()["data"]["version"] == 2
+    assert rejected_edit.json()["data"]["status"] == "rejected"
+
+    second_submit = client.post(
+        f"/api/v1/projects/{project_id}/submit",
+        json={"content": {"goal": "submitted-v3", "budget": 30, "notes": "final"}},
+        headers=owner_headers,
+    )
+    assert second_submit.status_code == 200
+    assert second_submit.json()["data"]["version"] == 3
+
+    v1_v2 = client.get(f"/api/v1/projects/{project_id}/diff?v1=1&v2=2", headers=owner_headers)
+    assert v1_v2.status_code == 200
+    diff_1_2 = v1_v2.json()["data"]["diff"]
+    assert diff_1_2["goal"] == {"old": "draft-edited", "new": "rejected-edited"}
+    assert diff_1_2["budget"] == {"old": 10, "new": 25}
+    assert diff_1_2["notes"] == {"old": None, "new": "revise"}
+
+    v2_v3 = client.get(f"/api/v1/projects/{project_id}/diff?v1=2&v2=3", headers=owner_headers)
+    assert v2_v3.status_code == 200
+    diff_2_3 = v2_v3.json()["data"]["diff"]
+    assert diff_2_3["goal"] == {"old": "rejected-edited", "new": "submitted-v3"}
+    assert diff_2_3["budget"] == {"old": 25, "new": 30}
+    assert diff_2_3["notes"] == {"old": "revise", "new": "final"}
+
+    with SessionLocal() as db:
+        project = db.get(Project, uuid.UUID(project_id))
+        assert project is not None
+        assert project.current_version_no == 3
+        versions = db.scalars(select(ProjectVersion).where(ProjectVersion.project_id == project.id).order_by(ProjectVersion.version_no.asc())).all()
+        assert len(versions) == 3
+        categories = [row.category for row in db.scalars(select(AuditLog).where(AuditLog.category == "project_draft_edited")).all()]
+        assert len(categories) == 2
 
 
 def test_metrics_date_start_date_end_and_downloadable_export():
@@ -640,6 +755,74 @@ def test_attachment_validation_checks_extension_and_signature():
     _assert_success_envelope(valid.json())
 
 
+@pytest.mark.parametrize("malicious_name", ["../x.pdf", "nested/path.pdf", "/tmp/rooted.pdf", "..\\win.pdf"])
+def test_attachment_rejects_path_traversal_filenames(malicious_name: str):
+    with SessionLocal() as db:
+        owner = create_user(db, "path_owner", "StrongPass12!", "Path Owner", RoleType.PROJECT_APPLICANT, None, None)
+        project = create_project(db, owner.id, "Path Guard Project", {"goal": "guard"})
+        project_id = project.id
+        owner_username = owner.username
+
+    client = TestClient(app)
+    headers = _auth_headers(owner_username, "StrongPass12!")
+
+    blocked = client.post(
+        f"/api/v1/projects/{project_id}/attachments",
+        files={"file": (malicious_name, b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n", "application/pdf")},
+        headers=headers,
+    )
+    assert blocked.status_code == 400
+    _assert_error_envelope(blocked.json())
+    assert blocked.json()["code"] == "attachment_invalid"
+
+    valid = client.post(
+        f"/api/v1/projects/{project_id}/attachments",
+        files={"file": ("safe.pdf", b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n", "application/pdf")},
+        headers=headers,
+    )
+    assert valid.status_code == 200
+    _assert_success_envelope(valid.json())
+    attachment_id = valid.json()["data"]["id"]
+
+    with SessionLocal() as db:
+        row = db.get(Attachment, uuid.UUID(attachment_id))
+        assert row is not None
+        assert row.filename == "safe.pdf"
+        assert row.file_path.startswith(str(os.path.abspath("./storage")))
+
+
+def test_attachment_rejects_control_chars_in_filename():
+    with SessionLocal() as db:
+        owner = create_user(db, "ctrl_owner", "StrongPass12!", "Ctrl Owner", RoleType.PROJECT_APPLICANT, None, None)
+        project = create_project(db, owner.id, "Control Guard Project", {"goal": "guard"})
+        with pytest.raises(DomainError):
+            save_attachment(
+                db,
+                project_id=project.id,
+                filename="bad\x1fname.pdf",
+                mime_type="application/pdf",
+                file_bytes=b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n",
+            )
+
+
+def test_attachment_endpoint_rejects_control_chars_in_filename():
+    with SessionLocal() as db:
+        owner = create_user(db, "ctrl_endpoint_owner", "StrongPass12!", "Ctrl Endpoint Owner", RoleType.PROJECT_APPLICANT, None, None)
+        project = create_project(db, owner.id, "Control Endpoint Project", {"goal": "guard"})
+        project_id = project.id
+
+    client = TestClient(app)
+    headers = _auth_headers("ctrl_endpoint_owner", "StrongPass12!")
+    resp = client.post(
+        f"/api/v1/projects/{project_id}/attachments",
+        files={"file": ("bad\x7fname.pdf", b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n", "application/pdf")},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "attachment_invalid"
+
+
 def test_role_based_403_for_protected_endpoint_groups():
     with SessionLocal() as db:
         create_user(db, "limited_user", "StrongPass12!", "Limited", RoleType.PROJECT_APPLICANT, None, None)
@@ -970,6 +1153,45 @@ def test_receipt_print_happy_path_unauthorized_and_audit():
         assert len(receipt_access) == 1
 
 
+def test_receipt_print_rolls_back_on_access_log_failure(monkeypatch):
+    with SessionLocal() as db:
+        cashier = create_user(db, "atomic_receipt_cashier", "StrongPass12!", "Atomic Receipt Cashier", RoleType.CASHIER, None, None)
+        product = Product(name="Receipt Atomic Item", barcode="receipt-atomic-1", internal_code="RA1", pinyin="receipt", unit_price=10.0)
+        db.add(product)
+        db.flush()
+        order = Order(
+            created_by_user_id=cashier.id,
+            status=OrderStatus.SETTLED,
+            subtotal_amount=10,
+            final_amount=10,
+            discount_amount=0,
+            settled_at=utcnow(),
+        )
+        db.add(order)
+        db.flush()
+        db.add(OrderLine(order_id=order.id, product_id=product.id, quantity=1, unit_price=10, line_discount=0))
+        db.commit()
+        order_id = str(order.id)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = _auth_headers("atomic_receipt_cashier", "StrongPass12!")
+
+    def fail_access_log(*_args, **_kwargs):
+        raise RuntimeError("receipt access log failed")
+
+    monkeypatch.setattr("app.api.v1.routes.write_access_log", fail_access_log)
+    resp = client.post(f"/api/v1/orders/{order_id}/receipt/print", headers=headers)
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "receipt_print_atomicity_failed"
+
+    with SessionLocal() as db:
+        receipt_audits = db.scalars(select(AuditLog).where(AuditLog.category == "receipt_printed")).all()
+        assert len(receipt_audits) == 0
+        receipt_access = db.scalars(select(AccessLog).where(AccessLog.action == "receipt_print")).all()
+        assert len(receipt_access) == 0
+
+
 def test_cross_user_financial_operations_are_forbidden():
     with SessionLocal() as db:
         owner = create_user(db, "fin_owner", "StrongPass12!", "Fin Owner", RoleType.CASHIER, None, None)
@@ -1127,12 +1349,212 @@ def test_refund_and_logs_commit_atomically_on_log_failure(monkeypatch):
         headers={**headers, "Idempotency-Key": "atomic-log-fail"},
     )
     assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "refund_atomicity_failed"
 
     with SessionLocal() as db:
         refunds = db.scalars(select(AfterSalesOrder).where(AfterSalesOrder.original_order_id == uuid.UUID(order_id))).all()
         assert len(refunds) == 0
         refund_audit = db.scalars(select(AuditLog).where(AuditLog.category == "refund_processed")).all()
         assert len(refund_audit) == 0
+        refund_access_logs = db.scalars(select(AccessLog).where(AccessLog.action == "after_sales_refund")).all()
+        assert len(refund_access_logs) == 0
+
+
+def test_settlement_rolls_back_on_audit_failure(monkeypatch):
+    with SessionLocal() as db:
+        cashier = create_user(db, "atomic_settle_cashier", "StrongPass12!", "Atomic Settle", RoleType.CASHIER, None, None)
+        product = Product(name="Atomic Settle Item", barcode="atomic-settle-1", internal_code="AS1", pinyin="atomic", unit_price=11.0)
+        db.add(product)
+        db.flush()
+        order = Order(created_by_user_id=cashier.id, status=OrderStatus.DRAFT, subtotal_amount=11, final_amount=11, discount_amount=0)
+        db.add(order)
+        db.commit()
+        order_id = str(order.id)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = _auth_headers("atomic_settle_cashier", "StrongPass12!")
+    def fail_audit(*_args, **_kwargs):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr("app.domain.services.write_audit", fail_audit)
+    resp = client.post(
+        f"/api/v1/orders/{order_id}/settle",
+        json={"payments": [{"method": "cash", "amount": 11.0}]},
+        headers=headers,
+    )
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "order_settlement_atomicity_failed"
+
+    with SessionLocal() as db:
+        order = db.get(Order, uuid.UUID(order_id))
+        assert order is not None
+        assert order.status == OrderStatus.DRAFT
+        payments = db.scalars(select(PaymentRecord).where(PaymentRecord.order_id == uuid.UUID(order_id))).all()
+        assert len(payments) == 0
+        settle_logs = db.scalars(select(AccessLog).where(AccessLog.action == "order_settle")).all()
+        assert len(settle_logs) == 0
+
+
+def test_project_status_change_rolls_back_on_audit_failure(monkeypatch):
+    with SessionLocal() as db:
+        applicant = create_user(db, "atomic_project_app", "StrongPass12!", "Atomic Project App", RoleType.PROJECT_APPLICANT, None, None)
+        create_user(db, "atomic_project_rev", "StrongPass12!", "Atomic Project Rev", RoleType.REVIEWER, None, None)
+        project = create_project(db, applicant.id, "Atomic Project", {"goal": "atomic"})
+        project.status = ProjectStatus.SUBMITTED
+        db.commit()
+        project_id = str(project.id)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    reviewer_headers = _auth_headers("atomic_project_rev", "StrongPass12!")
+    def fail_audit(*_args, **_kwargs):
+        raise RuntimeError("project audit failed")
+
+    monkeypatch.setattr("app.domain.services.write_audit", fail_audit)
+    resp = client.patch(f"/api/v1/projects/{project_id}/status", json={"action": "start_review"}, headers=reviewer_headers)
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "project_status_atomicity_failed"
+
+    with SessionLocal() as db:
+        project = db.get(Project, uuid.UUID(project_id))
+        assert project is not None
+        assert project.status == ProjectStatus.SUBMITTED
+        project_audits = db.scalars(select(AuditLog).where(AuditLog.category == "project_status_changed")).all()
+        assert len(project_audits) == 0
+        project_access = db.scalars(select(AccessLog).where(AccessLog.action == "project_review_status_change")).all()
+        assert len(project_access) == 0
+
+
+def test_attachment_upload_rolls_back_on_access_log_failure(monkeypatch):
+    with SessionLocal() as db:
+        owner = create_user(db, "atomic_attach_owner", "StrongPass12!", "Atomic Attach", RoleType.PROJECT_APPLICANT, None, None)
+        project = create_project(db, owner.id, "Atomic Attach Project", {"goal": "attach"})
+        project_id = str(project.id)
+
+    def fail_access_log(*_args, **_kwargs):
+        raise RuntimeError("access log write failed")
+
+    monkeypatch.setattr("app.api.v1.routes.write_access_log", fail_access_log)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = _auth_headers("atomic_attach_owner", "StrongPass12!")
+    resp = client.post(
+        f"/api/v1/projects/{project_id}/attachments",
+        files={"file": ("atomic.pdf", b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n", "application/pdf")},
+        headers=headers,
+    )
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "attachment_upload_atomicity_failed"
+
+    with SessionLocal() as db:
+        attachments = db.scalars(select(Attachment).where(Attachment.project_id == uuid.UUID(project_id))).all()
+        assert len(attachments) == 0
+        upload_logs = db.scalars(select(AccessLog).where(AccessLog.action == "attachment_upload")).all()
+        assert len(upload_logs) == 0
+
+
+def test_permission_grant_rolls_back_on_access_log_failure(monkeypatch):
+    with SessionLocal() as db:
+        create_user(db, "atomic_perm_admin", "StrongPass12!", "Atomic Perm Admin", RoleType.OP_ADMIN, None, None)
+        target = create_user(db, "atomic_perm_target", "StrongPass12!", "Atomic Perm Target", RoleType.CASHIER, None, None)
+        target_user_id = str(target.id)
+
+    def fail_access_log(*_args, **_kwargs):
+        raise RuntimeError("access log write failed")
+
+    monkeypatch.setattr("app.api.v1.routes.write_access_log", fail_access_log)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = _auth_headers("atomic_perm_admin", "StrongPass12!")
+    resp = client.post(
+        "/api/v1/permissions/grant",
+        json={"target_user_id": target_user_id, "role": "reviewer"},
+        headers=headers,
+    )
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "permission_grant_atomicity_failed"
+
+    with SessionLocal() as db:
+        binding = db.scalar(
+            select(UserRoleBinding).where(
+                UserRoleBinding.user_id == uuid.UUID(target_user_id),
+                UserRoleBinding.role == RoleType.REVIEWER,
+            )
+        )
+        assert binding is None
+        perm_audits = db.scalars(select(AuditLog).where(AuditLog.category == "permission_granted")).all()
+        assert len(perm_audits) == 0
+        perm_logs = db.scalars(select(AccessLog).where(AccessLog.action == "permission_grant")).all()
+        assert len(perm_logs) == 0
+
+
+def test_shift_create_rolls_back_on_access_log_failure(monkeypatch):
+    with SessionLocal() as db:
+        create_user(db, "atomic_shift_admin", "StrongPass12!", "Atomic Shift Admin", RoleType.OP_ADMIN, None, None)
+        assignee = create_user(db, "atomic_shift_assignee", "StrongPass12!", "Atomic Shift Assignee", RoleType.CASHIER, None, None)
+        assignee_id = str(assignee.id)
+
+    def fail_access_log(*_args, **_kwargs):
+        raise RuntimeError("access log write failed")
+
+    monkeypatch.setattr("app.api.v1.routes.write_access_log", fail_access_log)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = _auth_headers("atomic_shift_admin", "StrongPass12!")
+    start = (utcnow() + timedelta(hours=1)).isoformat()
+    end = (utcnow() + timedelta(hours=2)).isoformat()
+    resp = client.post(
+        "/api/v1/shifts",
+        json={"assigned_user_id": assignee_id, "starts_at": start, "ends_at": end, "note": "atomic shift"},
+        headers=headers,
+    )
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "shift_create_atomicity_failed"
+
+    with SessionLocal() as db:
+        shifts = db.scalars(select(ShiftSchedule).where(ShiftSchedule.assigned_user_id == uuid.UUID(assignee_id))).all()
+        assert len(shifts) == 0
+        shift_audits = db.scalars(select(AuditLog).where(AuditLog.category == "shift_created")).all()
+        assert len(shift_audits) == 0
+        shift_logs = db.scalars(select(AccessLog).where(AccessLog.action == "shift_create")).all()
+        assert len(shift_logs) == 0
+
+
+def test_notification_read_rolls_back_on_access_log_failure(monkeypatch):
+    with SessionLocal() as db:
+        owner = create_user(db, "atomic_note_owner", "StrongPass12!", "Atomic Note Owner", RoleType.PROJECT_APPLICANT, None, None)
+        note = push_notification(
+            db,
+            NotificationEvent(
+                event_type="pending_approval",
+                object_id="atomic-note-1",
+                recipient_user_id=owner.id,
+                message="mark me",
+            ),
+        )
+        assert note is not None
+        notification_id = str(note.id)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = _auth_headers("atomic_note_owner", "StrongPass12!")
+
+    def fail_access_log(*_args, **_kwargs):
+        raise RuntimeError("notification access log failed")
+
+    monkeypatch.setattr("app.api.v1.routes.write_access_log", fail_access_log)
+    resp = client.patch(f"/api/v1/notifications/{notification_id}/read", headers=headers)
+    assert resp.status_code == 500
+    _assert_error_envelope(resp.json())
+    assert resp.json()["code"] == "notification_read_atomicity_failed"
+
+    with SessionLocal() as db:
+        note = db.get(Notification, uuid.UUID(notification_id))
+        assert note is not None
+        assert note.read_at is None
+        note_logs = db.scalars(select(AccessLog).where(AccessLog.action == "notification_mark_read")).all()
+        assert len(note_logs) == 0
 
 
 def test_duplicate_username_returns_409_username_exists():

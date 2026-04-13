@@ -42,6 +42,16 @@ def validate_runtime_settings(settings: Settings) -> None:
             "Use APP_ENV=dev and ALLOW_DEV_SQLITE_OVERRIDE=true only for explicit local SQLite override."
         )
 
-    # Enforce a strong HS256 key outside local dev.
-    if settings.app_env.lower() != "dev" and settings.jwt_algorithm.upper() == "HS256" and len(settings.jwt_secret) < 32:
+    app_env = settings.app_env.lower()
+    dev_safe_mode = app_env in {"dev", "test"}
+    placeholder_jwt_secrets = {"", "dev-secret-change-me", "change-me", "changeme", "default", "secret"}
+    placeholder_master_keys = {"", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "change-me", "changeme"}
+
+    if not dev_safe_mode and settings.jwt_secret in placeholder_jwt_secrets:
+        raise RuntimeError("JWT_SECRET uses a placeholder/default value and must be replaced in non-dev runtime")
+    if not dev_safe_mode and settings.master_encryption_key in placeholder_master_keys:
+        raise RuntimeError("MASTER_ENCRYPTION_KEY uses a placeholder/default value and must be replaced in non-dev runtime")
+
+    # Enforce a strong HS256 key outside local dev-safe runtime.
+    if not dev_safe_mode and settings.jwt_algorithm.upper() == "HS256" and len(settings.jwt_secret) < 32:
         raise RuntimeError("JWT_SECRET must be at least 32 bytes when using HS256 outside dev")

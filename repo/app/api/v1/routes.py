@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Header, UploadFile, WebSocket, WebSocketDisconnect
@@ -24,6 +26,7 @@ from app.domain.services import (
     create_project,
     create_shift,
     create_user,
+    edit_project_draft,
     export_daily_metrics_csv,
     get_shift,
     get_project_diff,
@@ -107,6 +110,18 @@ def _assert_order_financial_access(db: Session, current_user: User, order_id: uu
     if RoleType.OP_ADMIN.value in roles:
         return order
     raise APIError(status_code=403, code="forbidden_order_access", message="Order financial access denied")
+
+
+def _raise_atomic_rollback(db: Session, code: str, message: str, exc: Exception) -> None:
+    db.rollback()
+    raise APIError(status_code=500, code=code, message=message) from exc
+
+
+def _commit_atomic(db: Session, code: str, message: str) -> None:
+    try:
+        db.commit()
+    except Exception as exc:
+        _raise_atomic_rollback(db, code, message, exc)
 
 
 class UserCreateReq(BaseModel):
@@ -201,6 +216,10 @@ class ProjectCreateReq(BaseModel):
 
 
 class ProjectSubmitReq(BaseModel):
+    content: dict[str, Any]
+
+
+class ProjectEditReq(BaseModel):
     content: dict[str, Any]
 
 
@@ -476,11 +495,20 @@ def settlement_handler(
         _assert_order_financial_access(db, current_user, order_id)
         order = settle_order(db, order_id, req.payments, current_user.id)
         write_access_log(db, current_user.id, "order_settle", "order", str(order_id))
-        db.commit()
-        db.refresh(order)
+        _commit_atomic(db, "order_settlement_atomicity_failed", "Settlement failed and transaction was rolled back")
         return success({"order_id": str(order.id), "status": order.status.value})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="settlement_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "order_settlement_atomicity_failed",
+            "Settlement failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.post("/orders/{order_id}/receipt/print", summary="Print settled order receipt")
@@ -492,10 +520,24 @@ def print_receipt_handler(
     try:
         result = print_receipt_for_order(db, order_id=order_id, actor_user_id=current_user.id)
         write_access_log(db, current_user.id, "receipt_print", "order", str(order_id))
-        db.commit()
+        _commit_atomic(
+            db,
+            "receipt_print_atomicity_failed",
+            "Receipt print logging failed and transaction was rolled back; receipt output may already have been emitted",
+        )
         return success(result)
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="receipt_print_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "receipt_print_atomicity_failed",
+            "Receipt print logging failed and transaction was rolled back; receipt output may already have been emitted",
+            exc,
+        )
 
 
 @router.post("/after-sales/refund")
@@ -518,11 +560,15 @@ def refund_handler(
             line_refunds=[l.model_dump() for l in req.line_refunds],
         )
         write_access_log(db, current_user.id, "after_sales_refund", "after_sales_order", str(row.id))
-        db.commit()
-        db.refresh(row)
+        _commit_atomic(db, "refund_atomicity_failed", "Refund failed and transaction was rolled back")
         return success({"refund_id": str(row.id), "amount": float(row.amount), "idempotency_key": row.idempotency_key})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="refund_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(db, "refund_atomicity_failed", "Refund failed and transaction was rolled back", exc)
 
 
 @router.post("/after-sales/exchange")
@@ -545,11 +591,15 @@ def exchange_handler(
             line_exchanges=[l.model_dump() for l in req.line_exchanges],
         )
         write_access_log(db, current_user.id, "after_sales_exchange", "after_sales_order", str(row.id))
-        db.commit()
-        db.refresh(row)
+        _commit_atomic(db, "exchange_atomicity_failed", "Exchange failed and transaction was rolled back")
         return success({"after_sales_id": str(row.id), "type": row.type, "amount": float(row.amount)})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="exchange_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(db, "exchange_atomicity_failed", "Exchange failed and transaction was rolled back", exc)
 
 
 @router.post("/after-sales/reverse-settlement")
@@ -571,11 +621,24 @@ def reverse_settlement_handler(
             user_id=current_user.id,
         )
         write_access_log(db, current_user.id, "after_sales_reverse_settlement", "after_sales_order", str(row.id))
-        db.commit()
-        db.refresh(row)
+        _commit_atomic(
+            db,
+            "reverse_settlement_atomicity_failed",
+            "Reverse settlement failed and transaction was rolled back",
+        )
         return success({"after_sales_id": str(row.id), "type": row.type, "amount": float(row.amount)})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="reverse_settlement_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "reverse_settlement_atomicity_failed",
+            "Reverse settlement failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.post("/orders/auto-void")
@@ -618,6 +681,21 @@ async def submit_project_handler(
         raise APIError(status_code=400, code="project_submit_failed", message=str(exc)) from exc
 
 
+@router.patch("/projects/{project_id}")
+def edit_project_handler(
+    project_id: uuid.UUID,
+    req: ProjectEditReq,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(RoleType.PROJECT_APPLICANT, RoleType.OP_ADMIN)),
+) -> dict[str, Any]:
+    _assert_project_access(db, current_user, project_id)
+    try:
+        row = edit_project_draft(db, project_id, req.content, current_user.id)
+        return success({"id": str(row.id), "status": row.status.value, "version": row.current_version_no})
+    except DomainError as exc:
+        raise APIError(status_code=400, code="project_edit_failed", message=str(exc)) from exc
+
+
 @router.post("/shifts", summary="Create shift schedule")
 def create_shift_handler(
     req: ShiftCreateReq,
@@ -634,7 +712,7 @@ def create_shift_handler(
             actor_user_id=current_user.id,
         )
         write_access_log(db, current_user.id, "shift_create", "shift", str(shift.id))
-        db.commit()
+        _commit_atomic(db, "shift_create_atomicity_failed", "Shift creation failed and transaction was rolled back")
         return success(
             {
                 "id": str(shift.id),
@@ -646,7 +724,12 @@ def create_shift_handler(
             }
         )
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="shift_create_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(db, "shift_create_atomicity_failed", "Shift creation failed and transaction was rolled back", exc)
 
 
 @router.get("/shifts", summary="List shifts (admin)")
@@ -731,10 +814,15 @@ def update_shift_handler(
             actor_user_id=current_user.id,
         )
         write_access_log(db, current_user.id, "shift_update", "shift", str(shift_id))
-        db.commit()
+        _commit_atomic(db, "shift_update_atomicity_failed", "Shift update failed and transaction was rolled back")
         return success({"id": str(row.id), "status": row.status.value, "starts_at": row.starts_at.isoformat(), "ends_at": row.ends_at.isoformat(), "note": row.note})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="shift_update_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(db, "shift_update_atomicity_failed", "Shift update failed and transaction was rolled back", exc)
 
 
 @router.patch("/shifts/{shift_id}/status", summary="Transition shift status")
@@ -747,10 +835,24 @@ def update_shift_status_handler(
     try:
         row = update_shift_status(db, shift_id=shift_id, status=req.status, actor_user_id=current_user.id)
         write_access_log(db, current_user.id, "shift_status_update", "shift", str(shift_id))
-        db.commit()
+        _commit_atomic(
+            db,
+            "shift_status_atomicity_failed",
+            "Shift status update failed and transaction was rolled back",
+        )
         return success({"id": str(row.id), "status": row.status.value})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="shift_status_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "shift_status_atomicity_failed",
+            "Shift status update failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.post("/permissions/grant", summary="Grant role binding")
@@ -762,10 +864,20 @@ def grant_permission_handler(
     try:
         row = grant_role_binding(db, target_user_id=req.target_user_id, role=req.role, actor_user_id=current_user.id)
         write_access_log(db, current_user.id, "permission_grant", "user_role_binding", str(row.id))
-        db.commit()
+        _commit_atomic(db, "permission_grant_atomicity_failed", "Permission grant failed and transaction was rolled back")
         return success({"binding_id": row.id, "target_user_id": str(row.user_id), "role": row.role.value})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="permission_grant_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "permission_grant_atomicity_failed",
+            "Permission grant failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.post("/permissions/revoke", summary="Revoke role binding")
@@ -777,10 +889,24 @@ def revoke_permission_handler(
     try:
         revoke_role_binding(db, target_user_id=req.target_user_id, role=req.role, actor_user_id=current_user.id)
         write_access_log(db, current_user.id, "permission_revoke", "user_role_binding", str(req.target_user_id))
-        db.commit()
+        _commit_atomic(
+            db,
+            "permission_revoke_atomicity_failed",
+            "Permission revoke failed and transaction was rolled back",
+        )
         return success({"target_user_id": str(req.target_user_id), "role": req.role.value, "revoked": True})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="permission_revoke_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "permission_revoke_atomicity_failed",
+            "Permission revoke failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.patch("/permissions/bindings/{binding_id}", summary="Update existing role binding")
@@ -793,10 +919,20 @@ def update_permission_handler(
     try:
         row = update_role_binding(db, binding_id=binding_id, new_role=req.role, actor_user_id=current_user.id)
         write_access_log(db, current_user.id, "permission_update", "user_role_binding", str(binding_id))
-        db.commit()
+        _commit_atomic(db, "permission_update_atomicity_failed", "Permission update failed and transaction was rolled back")
         return success({"binding_id": row.id, "target_user_id": str(row.user_id), "role": row.role.value})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="permission_update_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "permission_update_atomicity_failed",
+            "Permission update failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.patch("/projects/{project_id}/status")
@@ -830,10 +966,24 @@ def project_status_handler(
     try:
         row = update_project_status(db, project_id, target_status, current_user.id)
         write_access_log(db, current_user.id, "project_review_status_change", "project", str(project_id))
-        db.commit()
+        _commit_atomic(
+            db,
+            "project_status_atomicity_failed",
+            "Project status change failed and transaction was rolled back",
+        )
         return success({"id": str(row.id), "status": row.status.value, "action": req.action})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="project_transition_failed", message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "project_status_atomicity_failed",
+            "Project status change failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.get("/projects/{project_id}/diff")
@@ -860,6 +1010,7 @@ async def upload_attachment(
 ) -> dict[str, Any]:
     _assert_project_access(db, current_user, project_id)
     data = await file.read()
+    row: Attachment | None = None
     try:
         row = save_attachment(
             db,
@@ -869,10 +1020,30 @@ async def upload_attachment(
             file_bytes=data,
         )
         write_access_log(db, current_user.id, "attachment_upload", "attachment", str(row.id))
-        db.commit()
+        _commit_atomic(
+            db,
+            "attachment_upload_atomicity_failed",
+            "Attachment upload failed and transaction was rolled back",
+        )
         return success({"id": str(row.id), "fingerprint": row.sha256_fingerprint})
     except DomainError as exc:
+        db.rollback()
         raise APIError(status_code=400, code="attachment_invalid", message=str(exc)) from exc
+    except APIError:
+        if row is not None:
+            with contextlib.suppress(OSError):
+                Path(row.file_path).unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        if row is not None:
+            with contextlib.suppress(OSError):
+                Path(row.file_path).unlink(missing_ok=True)
+        _raise_atomic_rollback(
+            db,
+            "attachment_upload_atomicity_failed",
+            "Attachment upload failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.get("/attachments/{attachment_id}/verify")
@@ -936,12 +1107,26 @@ def read_notification(
     try:
         row = mark_notification_read_for_user(db, notification_id, current_user.id)
         write_access_log(db, current_user.id, "notification_mark_read", "notification", str(notification_id))
-        db.commit()
+        _commit_atomic(
+            db,
+            "notification_read_atomicity_failed",
+            "Notification read update failed and transaction was rolled back",
+        )
         return success({"id": str(row.id), "read_at": row.read_at.isoformat() if row.read_at else None})
     except DomainError as exc:
+        db.rollback()
         code = "notification_not_found" if "not found" in str(exc).lower() else "forbidden_notification_access"
         status_code = 404 if code == "notification_not_found" else 403
         raise APIError(status_code=status_code, code=code, message=str(exc)) from exc
+    except APIError:
+        raise
+    except Exception as exc:
+        _raise_atomic_rollback(
+            db,
+            "notification_read_atomicity_failed",
+            "Notification read update failed and transaction was rolled back",
+            exc,
+        )
 
 
 @router.websocket("/notifications/stream")
