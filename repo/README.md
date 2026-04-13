@@ -49,6 +49,56 @@ export ALLOW_DEV_SQLITE_OVERRIDE=true
 - ReDoc: `http://127.0.0.1:8000/redoc`
 - OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
 
+## Authentication
+
+### JWT settings
+
+- `JWT_SECRET`: signing key (use a strong secret outside local dev)
+- `JWT_ALGORITHM`: default `HS256`
+- `ACCESS_TOKEN_EXPIRE_MINUTES`: default `120`
+
+### Bootstrap admin (HTTP path)
+
+To allow first admin creation through API:
+
+```bash
+export BOOTSTRAP_MODE=true
+export INSTALL_BOOTSTRAP_TOKEN="your-install-token"
+```
+
+Then call:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/auth/seed-admin" \
+  -H "Content-Type: application/json" \
+  -H "X-Install-Token: your-install-token" \
+  -d '{"username":"admin","password":"StrongPassword123!"}'
+```
+
+### Login and bearer token usage
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"StrongPassword123!"}'
+```
+
+Use `data.access_token` in protected routes:
+
+```bash
+curl -X GET "http://127.0.0.1:8000/api/v1/products/search?q=coffee" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Auth behavior
+
+- Login lockout: account is locked after 5 failed attempts for 15 minutes.
+- Missing bearer token: `401` (`missing_token`).
+- Invalid/expired token: `401` (`invalid_token`).
+- Inactive users: `403` (`inactive_user`).
+- Users flagged for password change get `403` (`password_change_required`) on protected endpoints until password is updated via `POST /api/v1/auth/change-password`.
+- Role-protected routes return `403` (`forbidden`) when role requirements are not met.
+
 ## Seed admin
 
 ```bash
